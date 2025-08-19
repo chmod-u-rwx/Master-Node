@@ -3,7 +3,7 @@ from typing import Any, Dict
 from uuid import UUID
 from fastapi import WebSocket, WebSocketDisconnect
 
-class WebsocketServerService:
+class MasterNodeWebsocketServerService:
     def __init__(self):
         self.connections: Dict[str, WebSocket] = {}
     
@@ -19,7 +19,7 @@ class WebsocketServerService:
                     print(f"From {worker_id}: {message}")
                     await self.handle_worker_message(worker_id, message)
                 except json.JSONDecodeError:
-                    print(f"Invalid JSON from worker {worker_id}")
+                    print(f"Invalid JSON from worker: {worker_id}")
                     await websocket.send_json({"error": "Invalid JSON format"})
                     continue 
         except WebSocketDisconnect:
@@ -55,17 +55,15 @@ class WebsocketServerService:
     async def send_to_worker(self, worker_id: UUID, data: dict[str, Any]):
         worker_key = str(worker_id)
         ws = self.connections.get(worker_key)
-        if ws:
-            try:
-                await ws.send_json(data)
-                print(f"Sent to {worker_id}: {data}")
-                return True
-            except Exception as e:
-                print(f"Failed to send to worker {worker_id}: {e}")
-                
-                if worker_key in self.connections:
-                    del self.connections[worker_key]
-                return False
-        else:
+        if not ws:
             print(f"Worker {worker_id} not connected")
-            return False
+            raise RuntimeError(f"Worker {worker_id} not connected")
+        
+        try:
+            await ws.send_json(data)
+            print(f"Sent to {worker_id}: {data}")
+        except Exception as e:
+            print(f"Failed to send to worker {worker_id}: {e}")
+            if worker_key in self.connections:
+                del self.connections[worker_key]
+            raise RuntimeError(f"Fauked ti send to worker {worker_id}: {e}")
