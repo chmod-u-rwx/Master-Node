@@ -66,4 +66,4 @@ class MasterNodeWebsocketServerService:
             print(f"Failed to send to worker {worker_id}: {e}")
             if worker_key in self.connections:
                 del self.connections[worker_key]
-            raise RuntimeError(f"Fauked ti send to worker {worker_id}: {e}")
+            raise RuntimeError(f"Failed to send to worker {worker_id}: {e}")
