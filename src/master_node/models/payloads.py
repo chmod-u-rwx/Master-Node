@@ -10,6 +10,19 @@ class MethodEnum(str, Enum):
     DELETE = "DELETE"
     RUN = "RUN"  # Custom method for jobs
 
+class MessageType(str, Enum):
+    HEARTBEAT = "heartbeat"
+    JOB_REQUEST = "job_request"
+    JOB_RESPONSE = "job_response"
+    STATUS_UPDATE = "status_update"
+    TASK_RESULT = "task_result"
+    ERROR = "error"
+
+class WebsocketMessage(BaseModel):
+    request_id: Optional[UUID] = Field(default=None)
+    type: MessageType = Field(...)
+    payloads: Any = Field(...)
+
 class JobRequestPayload(BaseModel):
     request_id: UUID = Field(...)
     method: Optional[MethodEnum] = Field(None, description="HTTP method")

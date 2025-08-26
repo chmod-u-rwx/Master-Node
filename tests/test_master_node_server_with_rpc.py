@@ -1,13 +1,22 @@
 import asyncio
-from pydantic import ValidationError
 import pytest
-from asyncio import Future
-from typing import Any
 from fastapi import WebSocketDisconnect
 from uuid import uuid4
-from unittest.mock import AsyncMock, patch
-from src.master_node.models.payloads import JobRequestPayload, JobResponsePayload, MethodEnum
-from src.master_node.services.master_node_websocket_server_service import MasterNodeWebsocketServerService
+from unittest.mock import AsyncMock
+from src.master_node.models.payloads import (
+    JobRequestPayload,
+    JobResponsePayload,
+    MethodEnum,
+    WebsocketMessage,
+    MessageType
+)
+from src.master_node.services.master_node_websocket_server_service import (
+    InvalidWorkerResponseError,
+    MasterNodeWebsocketServerService,
+    RPCRequestTimeoutError,
+    WorkerCommunicationError,
+    WorkerNotConnectedError
+)
 
 class TestMasterNodeWebsocketServerService:
     """Unit tests for MasterNodeWebsocketServerService"""
@@ -27,7 +36,6 @@ class TestMasterNodeWebsocketServerService:
 
     @pytest.fixture
     def sample_job_request(self):
-        """Create a sample job request payload"""
         return JobRequestPayload(
             request_id=uuid4(),
             method=MethodEnum.RUN,
@@ -37,10 +45,10 @@ class TestMasterNodeWebsocketServerService:
         )
 
     @pytest.fixture
-    def sample_job_response(self):
+    def sample_job_response(self, sample_job_request: JobRequestPayload):
         """Create a sample job response payload"""
         return JobResponsePayload(
-            request_id=uuid4(),
+            request_id=sample_job_request.request_id,
             status = "ok",
             result = {"output": "test_result"},
             error = None,
@@ -48,29 +56,21 @@ class TestMasterNodeWebsocketServerService:
         )
     
     @pytest.mark.asyncio
-    async def test_connect_stores_worker_connection(self, service: MasterNodeWebsocketServerService, mock_websocket: AsyncMock):
-        """Test that connect method stores worker connection"""
-        
-        worker_id = (uuid4())
-        mock_websocket.receive_json.side_effect = [{"type": "heartbeat"}, WebSocketDisconnect()]
+    async def test_connect_accepts_and_cleans_connection(
+        self,
+        service: MasterNodeWebsocketServerService,
+        mock_websocket: AsyncMock
+    ):  
+        worker_id = uuid4()
+        mock_websocket.receive_json.side_effect = [
+            {"type": "heartbeat", "payloads": {}},
+            WebSocketDisconnect()
+        ]
 
         await service.connect(worker_id, mock_websocket)
 
         assert str(worker_id) not in service.connections
         mock_websocket.accept.assert_called_once()
-    
-    @pytest.mark.asyncio
-    async def test_connect_handles_websocket_disconnect(self, service: MasterNodeWebsocketServerService, mock_websocket: AsyncMock):
-        """Test that connect method handles WebSocket disconnect gracefully"""
-        
-        worker_id = (uuid4())
-        mock_websocket.receive_json.side_effect = [{"type": "heartbeat"}, WebSocketDisconnect()]
-        
-        with patch("builtins.print") as mock_print:
-            await service.connect(worker_id, mock_websocket)
-
-        mock_print.assert_any_call(f"Worker {worker_id} disconnected normally")
-        assert str(worker_id) not in service.connections
     
     @pytest.mark.asyncio
     async def test_send_job_rpc_to_worker_node_success(
@@ -83,21 +83,32 @@ class TestMasterNodeWebsocketServerService:
         """Test successful job request sending and response handling"""
         worker_id = uuid4()
         service.connections[str(worker_id)] = mock_websocket
-
-        async def mock_wait_for(future: Future[Any], timeout): # type: ignore
-            future.set_result(sample_job_response.model_dump())
-            return sample_job_response.model_dump()
-
-        with patch("asyncio.wait_for", side_effect=mock_wait_for), \
-            patch("builtins.print"):
-            
-            result = await service.send_job_rpc_to_worker_node(worker_id, sample_job_request, timeout=30.0)
-
-        mock_websocket.send_json.assert_called_once_with(sample_job_request.model_dump())
         
-        assert isinstance(result, JobResponsePayload)
-        assert result.status == "ok"
-        assert len(service.pending_requests) == 0
+        async def simulate_response():
+            await asyncio.sleep(0.1)
+            request_id = str(sample_job_request.request_id)
+            if request_id in service.pending_requests:
+                response = sample_job_response.model_copy(update={"request_id": sample_job_request.request_id})
+                future = service.pending_requests[request_id]
+                future.set_result(response.model_dump())
+        
+        response_task = asyncio.create_task(simulate_response())
+        
+        try:
+            # Make the RPC call
+            result = await service.send_job_rpc_to_worker_node(
+                worker_id=worker_id,
+                job_payload=sample_job_request,
+                timeout=1.0
+            )
+            
+            assert isinstance(result, JobResponsePayload)
+            assert result.request_id == sample_job_request.request_id
+            assert result.status == "ok"
+            mock_websocket.send_json.assert_called_once()
+        finally:
+            if not response_task.done():
+                response_task.cancel()
     
     @pytest.mark.asyncio
     async def test_send_job_rpc_to_worker_node_worker_not_connected(
@@ -106,13 +117,13 @@ class TestMasterNodeWebsocketServerService:
         sample_job_request: JobRequestPayload
     ):
         """Test job request fails when worker is not connected"""
-        
         worker_id = uuid4()
         
-        with pytest.raises(RuntimeError) as exc_info:
-            await service.send_job_rpc_to_worker_node(worker_id, sample_job_request)
-        
-        assert f"Worker {worker_id} not connected" in str(exc_info.value)
+        with pytest.raises(WorkerNotConnectedError):
+            await service.send_job_rpc_to_worker_node(
+                worker_id=worker_id,
+                job_payload=sample_job_request
+            )
     
     @pytest.mark.asyncio
     async def test_send_job_rpc_to_worker_node_timeout(
@@ -126,14 +137,13 @@ class TestMasterNodeWebsocketServerService:
         worker_id = uuid4()
         service.connections[str(worker_id)] = mock_websocket
 
-        with patch("asyncio.wait_for", side_effect=asyncio.TimeoutError), \
-            patch("builtins.print") as mock_print:
+        with pytest.raises(RPCRequestTimeoutError):
+            await service.send_job_rpc_to_worker_node(
+                worker_id,
+                sample_job_request,
+                timeout=1.0
+            )
             
-            with pytest.raises(asyncio.TimeoutError) as exc_info:
-                await service.send_job_rpc_to_worker_node(worker_id, sample_job_request, timeout=1.0)
-
-        mock_print.assert_any_call(f"Job request to worker {worker_id} timed out after 1.0s")
-        assert f"Worker {worker_id} did not respond within 1.0 seconds" in str(exc_info.value)
         assert len(service.pending_requests) == 0
     
     @pytest.mark.asyncio
@@ -148,106 +158,110 @@ class TestMasterNodeWebsocketServerService:
         worker_id = uuid4()
         service.connections[str(worker_id)] = mock_websocket
         
-        invalid_response = {"invalid": "response"}
+        async def simulate_invalid_response():
+            await asyncio.sleep(0.1)
+            request_id = str(sample_job_request.request_id)
+            if request_id in service.pending_requests:
+                future = service.pending_requests[request_id]
+                future.set_result({"invalid": "response_format"})  # Missing required fields
         
-        async def mock_wait_for(future: Future[Any], timeout): # type: ignore
-            future.set_result(invalid_response)
-            return invalid_response
+        response_task = asyncio.create_task(simulate_invalid_response())
         
-        with patch("asyncio.wait_for", side_effect=mock_wait_for), \
-            patch("builtins.print"):
-            with pytest.raises(RuntimeError):
-                await service.send_job_rpc_to_worker_node(worker_id, sample_job_request)
+        try:
+            with pytest.raises(InvalidWorkerResponseError):
+                await service.send_job_rpc_to_worker_node(
+                    worker_id=worker_id,
+                    job_payload=sample_job_request,
+                    timeout=1.0
+                )
+        finally:
+            if not response_task.done():
+                response_task.cancel()
+                await response_task
     
     @pytest.mark.asyncio
-    async def test_handle_worker_message_invalid_rpc_response(self, service: MasterNodeWebsocketServerService):
-        """Test handling of invalid RPC response format"""
-        
-        worker_id = uuid4()
-        request_id = str(uuid4())
-        invalid_response = {"request_id": request_id, "invalid": "format"}
-        
-        future: Future[Any] = Future()
-        service.pending_requests[request_id] = future
-        
-        with patch("builtins.print") as mock_print:
-            await service.handle_worker_message(worker_id, invalid_response)
-        
-        assert future.done()
-        assert isinstance(future.exception(), ValidationError)
-        
-        calls = [str(call) for call in mock_print.call_args_list]
-        assert any(
-            f"Invalid response format for request {request_id}: " in c and "validation error for JobResponsePayload" in c
-            for c in calls
-        )
-    
-    @pytest.mark.asyncio
-    async def test_handle_worker_message_unknown_type(self, service: MasterNodeWebsocketServerService, mock_websocket: AsyncMock):
-        """Test handling of messages with unknown type"""
-        
-        worker_id = uuid4()
-        service.connections[str(worker_id)] = mock_websocket
-        message = {"type": "unknown_type", "data": "some_data"}
-        
-        with patch("builtins.print") as mock_print:
-            await service.handle_worker_message(worker_id, message)
-        
-        mock_print.assert_any_call(f"Unknown message type from worker {worker_id}: {message}")
-        mock_websocket.send_json.assert_called_with({"error": "Unknown message type"})
-    
-    @pytest.mark.asyncio
-    async def test_send_to_worker_success(
-        self,
+    async def test_send_websocket_message_success(
+        self, 
         service: MasterNodeWebsocketServerService,
-        mock_websocket: AsyncMock
+        mock_websocket: AsyncMock,
     ):
-        """Test successful fire-and-forget message sending"""
+        """Test successful WebSocket message sending"""
         
         worker_id = uuid4()
-        data = {"message": "test_data"}
         service.connections[str(worker_id)] = mock_websocket
-
-        with patch("builtins.print") as mock_print:
-            await service.send_to_worker(worker_id, data)
-
-        mock_websocket.send_json.assert_called_once_with(data)
-        mock_print.assert_any_call(f"Sent to {worker_id}: {data}")
+        
+        ws_message = WebsocketMessage(
+            type=MessageType.HEARTBEAT,
+            request_id=None,
+            payloads={"test": "data"}
+        )
+        
+        await service.send_websocket_message_to_worker(worker_id, ws_message)
+        
+        mock_websocket.send_json.assert_called_once()
+        call_args = mock_websocket.send_json.call_args[0][0]
+        assert call_args["type"] == MessageType.HEARTBEAT
+    
+    @pytest.mark.asyncio
+    async def test_send_to_worker_fire_and_forget(
+        self, 
+        service: MasterNodeWebsocketServerService,
+        mock_websocket: AsyncMock,
+    ):
+        worker_id = uuid4()
+        service.connections[str(worker_id)] = mock_websocket
+        
+        ws_message = WebsocketMessage(
+            type=MessageType.HEARTBEAT,
+            request_id=None,
+            payloads={"test": "data"}
+        )
+        
+        await service.send_to_worker(worker_id, ws_message)
+        
+        mock_websocket.send_json.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_send_to_worker_not_connected(
+    async def test_send_websocket_message_worker_not_connected(
         self,
         service: MasterNodeWebsocketServerService
     ):
-        """Test send_to_worker fails when worker is not connected"""
-        worker_id = uuid4()
-        data = {"message": "test_data"}
-
-        with pytest.raises(RuntimeError) as exc_info:
-            await service.send_to_worker(worker_id, data)
-
-        assert f"Worker {worker_id} not connected" in str(exc_info.value)
+        """Test sending message when worker not connected"""
+        
+        worker_id=uuid4()
+        ws_message = WebsocketMessage(
+            type=MessageType.HEARTBEAT,
+            request_id=None,
+            payloads={"test": "data"}
+        )
+        
+        with pytest.raises(WorkerNotConnectedError):
+            await service.send_websocket_message_to_worker(worker_id, ws_message)
     
     @pytest.mark.asyncio
-    async def test_send_to_worker_send_fails(
+    async def test_send_websocket_message_communication_error(
         self,
         service: MasterNodeWebsocketServerService,
         mock_websocket: AsyncMock
     ):
-        """Test send_to_worker handles send failures"""
+        """Test communication error during message sending"""
         
         worker_id = uuid4()
-        data = {"message": "test_data"}
         service.connections[str(worker_id)] = mock_websocket
-        mock_websocket.send_json.side_effect = Exception("Send failed")
-
-        with patch("builtins.print") as mock_print:
-            with pytest.raises(RuntimeError) as exc_info:
-                await service.send_to_worker(worker_id, data)
-
-        mock_print.assert_any_call(f"Failed to send to worker {worker_id}: Send failed")
-        assert f"Failed to send to worker {worker_id}: Send failed" in str(exc_info.value)
-
+        mock_websocket.send_json.side_effect = Exception("Connection lost")
+        
+        ws_message = WebsocketMessage(
+            type=MessageType.HEARTBEAT,
+            request_id=None,
+            payloads={"test": "data"}
+        )
+        
+        with pytest.raises(WorkerCommunicationError):
+            await service.send_websocket_message_to_worker(worker_id, ws_message)
+        
+        # Verify worker was removed from connections
+        assert not service.is_worker_connected(worker_id)
+    
     def test_get_connected_workers(
         self,
         service: MasterNodeWebsocketServerService,
@@ -293,3 +307,50 @@ class TestMasterNodeWebsocketServerService:
         service.pending_requests["req2"] = asyncio.Future()
         
         assert service.get_pending_requests_count() == 2
+
+    @pytest.mark.asyncio
+    async def test_full_rpc_flow(
+        self,
+        service: MasterNodeWebsocketServerService,
+        sample_job_request: JobRequestPayload,
+    ):
+        """Test complete RPC flow with mock worker"""
+        
+        worker_id=uuid4()
+                
+        mock_websocket = AsyncMock()
+        service.connections[str(worker_id)] = mock_websocket
+        assert service.is_worker_connected(worker_id)
+        
+        expected_response = JobResponsePayload(
+            request_id=sample_job_request.request_id,
+            status="ok",
+            error=None,
+            result={"output": "success"}
+        )
+        
+        rpc_task = asyncio.create_task(
+            service.send_job_rpc_to_worker_node(
+                worker_id=worker_id,
+                job_payload=sample_job_request,
+                timeout=10.0
+            )
+        )
+        
+        await asyncio.sleep(0.01)
+    
+        # Now simulate the worker response
+        request_id = str(sample_job_request.request_id)
+        if request_id in service.pending_requests:
+            future = service.pending_requests[request_id]
+            if not future.done():
+                future.set_result(expected_response.model_dump())
+
+        result = await rpc_task
+            
+        # Verify result
+        assert result.request_id == sample_job_request.request_id
+        assert result.status == "ok"
+        assert result.result == {"output": "success"}
+        mock_websocket.send_json.assert_called_once()
+        assert service.get_pending_requests_count() == 0
