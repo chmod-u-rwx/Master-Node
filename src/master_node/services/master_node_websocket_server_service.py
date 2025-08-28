@@ -54,6 +54,80 @@ class MasterNodeWebsocketServerService:
             if str(worker_id) in self.connections:
                 del self.connections[str(worker_id)]
                 print(f"Cleaned up connection for worker {worker_id}")
+
+    # ---- Send to Worker ----
+    
+    async def send_to_worker(self, worker_id: UUID, ws_message: WebsocketMessage):
+        """
+        Send arbitrary data to worker (fire-and-forget style)
+        """
+        
+        worker_key = str(worker_id)
+        ws = self.connections.get(worker_key)
+        
+        if not ws:
+            print(f"Worker {worker_id} not connected")
+            raise RuntimeError(f"Worker {worker_id} not connected")
+        
+        try:
+            await self.send_websocket_message_to_worker(worker_id, ws_message)
+        except Exception as e:
+            print(f"Failed to send to worker {worker_id}: {e}")
+            if worker_key in self.connections:
+                raise RuntimeError(f"Failed to send to worker {worker_id}: {e}")
+    
+    async def send_websocket_message_to_worker(
+        self,
+        worker_id: UUID,
+        ws_message: WebsocketMessage
+    ):
+        ws = self._get_websocket_or_raise(worker_id)
+        
+        try:
+            message_data = ws_message.model_dump()
+            await ws.send_json(message_data)
+        except Exception as e:
+            self.connections.pop(str(worker_id), None)
+            raise WorkerCommunicationError(f"Failed to send to worker {worker_id}: {e}")
+
+    async def send_job_rpc_to_worker_node(
+        self,
+        worker_id: UUID,
+        job_payload: JobRequestPayload,
+        timeout: float = 30.0
+    ) -> JobResponsePayload:
+        
+        if not self.is_worker_connected(worker_id):
+            raise WorkerNotConnectedError(f"Worker {worker_id} not connected")
+        
+        ws = self._get_websocket_or_raise(worker_id)
+        
+        request_id = job_payload.request_id
+        
+        response_future: Future[Any] = asyncio.Future()
+        self.pending_requests[str(request_id)] = response_future
+        
+        ws_message = WebsocketMessage(
+            type=MessageType.JOB_REQUEST,
+            request_id=job_payload.request_id,
+            payloads=job_payload.model_dump(),
+        )
+        
+        try:
+            await ws.send_json(ws_message.model_dump())
+            response = await asyncio.wait_for(response_future, timeout=timeout)
+            
+            return JobResponsePayload(**response)
+        
+        except ValidationError as ve:
+            raise InvalidWorkerResponseError(f"Invalid response from worker: {ve}")
+        except asyncio.TimeoutError as e:
+            raise RPCRequestTimeoutError(f"Worker {worker_id} did not respond within {timeout} seconds") from e
+        except Exception as e:
+            raise RuntimeError(f"Failed to send job request to worker {worker_id}: {e}")
+        
+        finally:
+            self.pending_requests.pop(str(request_id), None)
     
     async def _handle_worker_websocket_message(
         self,
@@ -120,45 +194,7 @@ class MasterNodeWebsocketServerService:
         except Exception as e:
             print(f"Failed to send error response: {e}")
 
-    async def send_job_rpc_to_worker_node(
-        self,
-        worker_id: UUID,
-        job_payload: JobRequestPayload,
-        timeout: float = 30.0
-    ) -> JobResponsePayload:
-        
-        if not self.is_worker_connected(worker_id):
-            raise WorkerNotConnectedError(f"Worker {worker_id} not connected")
-        
-        ws = self._get_websocket_or_raise(worker_id)
-        
-        request_id = job_payload.request_id
-        
-        response_future: Future[Any] = asyncio.Future()
-        self.pending_requests[str(request_id)] = response_future
-        
-        ws_message = WebsocketMessage(
-            type=MessageType.JOB_REQUEST,
-            request_id=job_payload.request_id,
-            payloads=job_payload.model_dump(),
-        )
-        
-        try:
-            await ws.send_json(ws_message.model_dump())
-            response = await asyncio.wait_for(response_future, timeout=timeout)
-            
-            return JobResponsePayload(**response)
-        
-        except ValidationError as ve:
-            raise InvalidWorkerResponseError(f"Invalid response from worker: {ve}")
-        except asyncio.TimeoutError as e:
-            raise RPCRequestTimeoutError(f"Worker {worker_id} did not respond within {timeout} seconds") from e
-        except Exception as e:
-            raise RuntimeError(f"Failed to send job request to worker {worker_id}: {e}")
-        
-        finally:
-            self.pending_requests.pop(str(request_id), None)
-    
+   
     # ---- Inbound Handler ----
     
     async def _handle_job_response(
@@ -191,41 +227,6 @@ class MasterNodeWebsocketServerService:
     async def _handle_task_result(self, worker_id: UUID, msg: WebsocketMessage):
         print(f"Task result from worker {worker_id}: {msg.payloads}")
     
-    # ---- Send to Worker ----
-    
-    async def send_to_worker(self, worker_id: UUID, ws_message: WebsocketMessage):
-        """
-        Send arbitrary data to worker (fire-and-forget style)
-        """
-        
-        worker_key = str(worker_id)
-        ws = self.connections.get(worker_key)
-        
-        if not ws:
-            print(f"Worker {worker_id} not connected")
-            raise RuntimeError(f"Worker {worker_id} not connected")
-        
-        try:
-            await self.send_websocket_message_to_worker(worker_id, ws_message)
-        except Exception as e:
-            print(f"Failed to send to worker {worker_id}: {e}")
-            if worker_key in self.connections:
-                raise RuntimeError(f"Failed to send to worker {worker_id}: {e}")
-    
-    async def send_websocket_message_to_worker(
-        self,
-        worker_id: UUID,
-        ws_message: WebsocketMessage
-    ):
-        ws = self._get_websocket_or_raise(worker_id)
-        
-        try:
-            message_data = ws_message.model_dump()
-            await ws.send_json(message_data)
-        except Exception as e:
-            self.connections.pop(str(worker_id), None)
-            raise WorkerCommunicationError(f"Failed to send to worker {worker_id}: {e}")
-
     # ----- Utilities -----
     
     def _get_websocket_or_raise(self, worker_id: UUID) -> WebSocket:
