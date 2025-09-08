@@ -43,7 +43,7 @@ class MasterNodeWebsocketServerService:
         await websocket.accept()
         worker_key = str(worker_id)
         self.connections[worker_key] = websocket
-    
+        print("/n/n/n connect", self.connections)
         try:
             await self._handle_worker_websocket_message(worker_id, websocket)
         except WebSocketDisconnect:
@@ -115,9 +115,9 @@ class MasterNodeWebsocketServerService:
         
         try:
             await ws.send_json(ws_message.model_dump())
-            response = await asyncio.wait_for(response_future, timeout=timeout)
+            response: JobResponsePayload = await asyncio.wait_for(response_future, timeout=timeout)
             
-            return JobResponsePayload(**response)
+            return response
         
         except ValidationError as ve:
             raise InvalidWorkerResponseError(f"Invalid response from worker: {ve}")
@@ -249,3 +249,5 @@ class MasterNodeWebsocketServerService:
         """Get count of pending RPC requests"""
         
         return len(self.pending_requests)
+    
+master_node_ws_server = MasterNodeWebsocketServerService()
