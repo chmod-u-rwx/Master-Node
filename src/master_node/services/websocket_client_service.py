@@ -94,6 +94,7 @@ class WebsocketClientService:
 
     async def handle_job_rpc_request(self, job_request: JobRequestPayload):
         print(master_node_ws_server.get_connected_workers())
+        print("handling job in client")
         response = await master_node_ws_server.send_job_rpc_to_worker_node(
             worker_id=job_request.worker_id,
             job_payload=job_request
