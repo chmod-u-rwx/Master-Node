@@ -164,7 +164,7 @@ class WebsocketClientService:
         #         raise MasterNodeDiscoveryError(f"HTTP request failed: {e}") from e
             
             websocket_url = f"ws://{INGRESS_ROUTER_URI}/ws/connect/{self.master_id}"
-            print(f"Discovered master node websocket at: {websocket_url}")
+            print(f"Discovered ingress router websocket at: {websocket_url}")
             return websocket_url
 
 master_client_ws = WebsocketClientService(master_id=UUID("550e8400-e29b-41d4-a716-446655440000"))
