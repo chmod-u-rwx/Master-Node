@@ -118,7 +118,8 @@ class MasterNodeWebsocketServerService:
         
         try:
             await ws.send_json(ws_message.model_dump(mode="json"))
-            response: JobResponsePayload = await asyncio.wait_for(response_future, timeout=timeout)
+            # response: JobResponsePayload = await asyncio.wait_for(response_future, timeout)
+            response: JobResponsePayload = await asyncio.wait_for(response_future, None)
             
             return response
         
