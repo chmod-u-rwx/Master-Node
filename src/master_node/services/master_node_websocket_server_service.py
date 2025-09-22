@@ -43,7 +43,7 @@ class MasterNodeWebsocketServerService:
         await websocket.accept()
         worker_key = str(worker_id)
         self.connections[worker_key] = websocket
-    
+        print("/n/n/n connect", self.connections)
         try:
             await self._handle_worker_websocket_message(worker_id, websocket)
         except WebSocketDisconnect:
@@ -97,6 +97,9 @@ class MasterNodeWebsocketServerService:
         timeout: float = 30.0
     ) -> JobResponsePayload:
         
+        print("workers: ", self.connections)
+        print("handling job in server")
+        
         if not self.is_worker_connected(worker_id):
             raise WorkerNotConnectedError(f"Worker {worker_id} not connected")
         
@@ -104,7 +107,7 @@ class MasterNodeWebsocketServerService:
         
         request_id = job_payload.request_id
         
-        response_future: Future[Any] = asyncio.Future()
+        response_future: Future[JobResponsePayload] = asyncio.Future()
         self.pending_requests[str(request_id)] = response_future
         
         ws_message = WebsocketMessage(
@@ -114,10 +117,11 @@ class MasterNodeWebsocketServerService:
         )
         
         try:
-            await ws.send_json(ws_message.model_dump())
-            response = await asyncio.wait_for(response_future, timeout=timeout)
+            await ws.send_json(ws_message.model_dump(mode="json"))
+            # response: JobResponsePayload = await asyncio.wait_for(response_future, timeout)
+            response: JobResponsePayload = await asyncio.wait_for(response_future, None)
             
-            return JobResponsePayload(**response)
+            return response
         
         except ValidationError as ve:
             raise InvalidWorkerResponseError(f"Invalid response from worker: {ve}")
@@ -249,3 +253,5 @@ class MasterNodeWebsocketServerService:
         """Get count of pending RPC requests"""
         
         return len(self.pending_requests)
+    
+master_node_ws_server = MasterNodeWebsocketServerService()
